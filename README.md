@@ -6,6 +6,8 @@ A lightweight, reliable postgres message queue with exactly-once-delivery. Publi
 
 SGQueue leverages PostgreSQL to store and manage messages using an SQL table for storing messages and a dead-letter table for storing failed messages. The client library handles enqueueing, dequeuing, and processing, with a scheduler managing delayed messages and stuck messages.
 
+[Architecture](./architecture.png)
+
 ## Features
 
 -   Exactly-Once Delivery: Ensures messages are delivered reliably using SQL ACID transactions and row-locks.

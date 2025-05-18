@@ -1,4 +1,4 @@
-package main
+package queue
 
 import "time"
 
@@ -10,8 +10,8 @@ type Config struct {
 }
 
 const (
-	DefaultPoolSize  = 10
-	VisibilityWindow = 5 * time.Minute
+	DefaultPoolSize         = 10
+	DefaultVisibilityWindow = 5 * time.Minute
 )
 
 func (c *Config) New() *Config {
@@ -19,7 +19,7 @@ func (c *Config) New() *Config {
 		c.PoolSize = DefaultPoolSize
 	}
 	if c.VisibilityWindow == 0 {
-		c.VisibilityWindow = VisibilityWindow
+		c.VisibilityWindow = DefaultVisibilityWindow
 	}
 
 	return c

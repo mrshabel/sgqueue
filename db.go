@@ -1,10 +1,11 @@
-package main
+package queue
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 
-	_ "github.com/jackc/pgx/v5"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
@@ -17,11 +18,12 @@ const (
 // DB is a representation of the underlying database
 type DB struct {
 	*sql.DB
+	queueName string
 }
 
 // New instantiates a new database connection and migrations
-func New(connStr string, maxConns int) (*DB, error) {
-	db, err := sql.Open("postgres", connStr)
+func NewDB(connStr string, maxConns int, queueName string) (*DB, error) {
+	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +44,7 @@ func New(connStr string, maxConns int) (*DB, error) {
 			queue_name VARCHAR(255) DEFAULT 'sgqueue',
 			payload JSONB NOT NULL,
 			status VARCHAR(50) DEFAULT 'pending',
-			idempotency_key UNIQUE VARCHAR(255),
+			idempotency_key VARCHAR(255) UNIQUE,
 			priority INTEGER DEFAULT 0,
 			retries INTEGER DEFAULT 0,
 			max_retries INTEGER DEFAULT 5,
@@ -56,18 +58,18 @@ func New(connStr string, maxConns int) (*DB, error) {
 			queue_name VARCHAR(255) NOT NULL,
 			message_id INTEGER REFERENCES messages(id),
 			failure_reason VARCHAR(1000),
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 
 		-- index for messages --
-		CREATE INDEX IF NOT EXISTS idx_messages_status_priority_created_at ON messages (status, priority, created_at)
+		CREATE INDEX IF NOT EXISTS idx_messages_queue_status_priority_created_at ON messages (queue_name, status, priority, created_at);
 	`
 
 	if _, err := db.Exec(migration_queries); err != nil {
 		return nil, err
 	}
 
-	return &DB{db}, nil
+	return &DB{db, queueName}, nil
 }
 
 // AddMessage adds a new message into the messages table
@@ -80,13 +82,13 @@ func (db *DB) AddMessage(ctx context.Context, message CreateMessage) error {
 
 	query :=
 		`
-		INSERT INTO messages (queue_name, status, idempotency_key, priority, retries, max_retries)
+		INSERT INTO messages (queue_name, payload, status, idempotency_key, priority, retries, max_retries)
 		VALUES
-		($1, $2, $3, $4, $5, $6)
-		-- RETURNING id, queue_name, status, idempotency_key, priority, retries, max_retries, created_at, started_at --
+		($1, $2, $3, $4, $5, $6, $7)
+		-- RETURNING id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at --
 	`
 
-	if _, err := tx.ExecContext(ctx, query, &message.QueueName, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries); err != nil {
+	if _, err := tx.ExecContext(ctx, query, &message.QueueName, &message.Payload, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -95,7 +97,7 @@ func (db *DB) AddMessage(ctx context.Context, message CreateMessage) error {
 	return tx.Commit()
 }
 
-// GetMessage retrieves a single message from the pending messages in order of priority and time the message was created
+// GetMessage retrieves a single message from the pending messages of a named-queue in order of priority and time the message was created
 func (db *DB) GetMessage(ctx context.Context) (*Message, error) {
 	// begin transaction. read only committed messages
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -110,24 +112,34 @@ func (db *DB) GetMessage(ctx context.Context) (*Message, error) {
 		WITH cte AS (
 			SELECT id
 			FROM messages
-			ORDER BY priority, created_at DESC
+			WHERE queue_name = $1 AND status = $2
+			ORDER BY priority DESC, created_at ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
 		-- update message status --
-		UPDATE tasks
-		SET status = $1, started_at = NOW()
+		UPDATE messages
+		SET status = $3, started_at = NOW()
 		FROM cte
 		WHERE messages.id = cte.id
-		RETURNING id, queue_name, status, idempotency_key, priority, retries, max_retries, created_at, started_at
+		RETURNING messages.id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at
 	`
 
 	var message Message
-	if err := tx.QueryRowContext(ctx, query, MessageInProgress).Scan(&message.ID, &message.QueueName, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
+	var payload []byte
+
+	if err := tx.QueryRowContext(ctx, query, &db.queueName, MessagePending, MessageInProgress).Scan(&message.ID, &message.QueueName, &payload, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
 		// rollback transaction
 		tx.Rollback()
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+
 		return nil, err
 	}
+
+	// save payload as byte-slice
+	message.Payload = payload
 
 	// commit transaction
 	if err := tx.Commit(); err != nil {
@@ -152,20 +164,21 @@ func (db *DB) GetBatchMessages(ctx context.Context, batchSize int) ([]*Message, 
 		WITH cte AS (
 			SELECT id
 			FROM messages
-			ORDER BY priority, created_at DESC
-			LIMIT $1
+			WHERE queue_name = $1 AND status = $2
+			ORDER BY priority DESC, created_at ASC
+			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
 		-- update message status --
-		UPDATE tasks
-		SET status = $2, started_at = NOW()
+		UPDATE messages
+		SET status = $4, started_at = NOW()
 		FROM cte
 		WHERE messages.id = cte.id
-		RETURNING id, queue_name, status, idempotency_key, priority, retries, max_retries, created_at, started_at
+		RETURNING messages.id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at
 	`
 
 	var messages []*Message
-	rows, err := tx.QueryContext(ctx, query, batchSize, MessageInProgress)
+	rows, err := tx.QueryContext(ctx, query, db.queueName, MessagePending, batchSize, MessageInProgress)
 	if err != nil {
 		// rollback transaction
 		tx.Rollback()
@@ -174,13 +187,15 @@ func (db *DB) GetBatchMessages(ctx context.Context, batchSize int) ([]*Message, 
 
 	for rows.Next() {
 		var message Message
+		var payload []byte
 
-		if err := rows.Scan(&message.ID, &message.QueueName, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
+		if err := rows.Scan(&message.ID, &message.QueueName, &payload, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
 			// rollback transaction
 			tx.Rollback()
 			return nil, err
 		}
 
+		message.Payload = payload
 		messages = append(messages, &message)
 	}
 
@@ -198,8 +213,8 @@ func (db *DB) GetBatchMessages(ctx context.Context, batchSize int) ([]*Message, 
 	return messages, nil
 }
 
-// MarkAsComplete updates the given task as completed
-func (db *DB) MarkAsComplete(ctx context.Context, id int) error {
+// UpdateStatus updates the status of given task to either completed or failed
+func (db *DB) UpdateStatus(ctx context.Context, id int, status MessageStatus) error {
 	// begin transaction. read only committed messages
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -208,15 +223,66 @@ func (db *DB) MarkAsComplete(ctx context.Context, id int) error {
 
 	query :=
 		`
-		UPDATE tasks
+		UPDATE messages
 		SET status = $1
 		WHERE id = $2
-		-- RETURNING id, queue_name, status, idempotency_key, priority, retries, max_retries, created_at, started_at --
+		-- RETURNING id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at --
 	`
 
-	if _, err := tx.ExecContext(ctx, query, MessageCompleted, id); err != nil {
+	if _, err := tx.ExecContext(ctx, query, status, id); err != nil {
 		tx.Rollback()
 		return err
+	}
+
+	// commit transaction
+	return tx.Commit()
+}
+
+// UpdateRetries updates the the status and retry count of a given task
+func (db *DB) UpdateRetries(ctx context.Context, id int, status MessageStatus) error {
+	// begin transaction. read only committed messages
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+
+	query :=
+		`
+		UPDATE messages
+		SET status = $1, retries = retries + 1
+		WHERE id = $2 AND retries < max_retries
+		-- RETURNING id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at --
+	`
+
+	result, err := tx.ExecContext(ctx, query, status, id)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// check if message was not updated as retry count was exceeded and move into dead letter queue
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	if rowsAffected == 0 {
+		query := `
+			INSERT INTO dead_letter_messages (queue_name, message_id, failure_reason)
+			VALUES ($1, $2, $3);
+		`
+		if _, err := tx.ExecContext(ctx, query, db.queueName, id, "Max retries exceeded"); err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		// set status to failed
+		query = `UPDATE messages SET status = $1 WHERE id = $2;`
+		if _, err := tx.ExecContext(ctx, query, MessageFailed, id); err != nil {
+			tx.Rollback()
+			return err
+		}
+
 	}
 
 	// commit transaction
@@ -231,17 +297,28 @@ func (db *DB) GetHangingMessages(ctx context.Context, interval string) ([]*Messa
 		return nil, err
 	}
 
-	// skip locked messages to ensure that only one worker can process the message
+	// message count
+	// query :=
+	// 	`
+	// 	SELECT COUNT(*)
+	// 	FROM messages
+	// 	WHERE status = $1
+	// 	AND started_at < NOW() INTERVAL $2
+	// `
+
+	// count := tx.ExecContext(ctx, query)
+
+	// messages query
 	query :=
 		`
-		SELECT id, queue_name, status, idempotency_key, priority, retries, max_retries, created_at, started_at
+		SELECT id, queue_name, payload, status, idempotency_key, priority, retries, max_retries, created_at, started_at
 		FROM messages
-		WHERE status = $1
-		AND started_at < NOW() INTERVAL $2
+		WHERE status = $1 AND queue_name = $2
+			AND started_at < NOW() - $3::INTERVAL
+		ORDER BY priority DESC, created_at ASC
 	`
-
 	var messages []*Message
-	rows, err := tx.QueryContext(ctx, query, MessagePending, interval)
+	rows, err := tx.QueryContext(ctx, query, MessagePending, db.queueName, interval)
 	if err != nil {
 		// rollback transaction
 		tx.Rollback()
@@ -250,13 +327,15 @@ func (db *DB) GetHangingMessages(ctx context.Context, interval string) ([]*Messa
 
 	for rows.Next() {
 		var message Message
+		var payload []byte
 
-		if err := rows.Scan(&message.ID, &message.QueueName, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
+		if err := rows.Scan(&message.ID, &message.QueueName, &payload, &message.Status, &message.IdempotencyKey, &message.Priority, &message.Retries, &message.MaxRetries, &message.CreatedAt, &message.StartedAt); err != nil {
 			// rollback transaction
 			tx.Rollback()
 			return nil, err
 		}
 
+		message.Payload = payload
 		messages = append(messages, &message)
 	}
 
