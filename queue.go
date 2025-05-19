@@ -23,7 +23,9 @@ type SGQueueConfig struct {
 	Name              string
 	DatabaseURL       string
 	MessageMaxRetries int
-	VisibilityWindow  time.Duration
+	// the maximum time a message can remaining processed by a consumer in minutes
+	VisibilityWindow time.Duration
+	// the maximum time required to complete each given task
 	ProcessingTimeout time.Duration
 }
 
@@ -80,6 +82,10 @@ func (q *SGQueue) Consume() (*SGMessage, error) {
 	msg, err := q.db.GetMessage(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// return if no message is present
+	if msg == nil {
+		return nil, nil
 	}
 
 	// decode json payload
@@ -200,7 +206,7 @@ func (q *SGQueue) nack(id int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), q.processingTimeout)
 	defer cancel()
 
-	return q.db.UpdateStatus(ctx, id, MessageFailed)
+	return q.db.UpdateStatus(ctx, id, MessagePending)
 }
 
 func (q *SGQueue) retry(id int) error {

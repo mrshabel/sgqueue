@@ -6,7 +6,7 @@ A lightweight, reliable postgres message queue with exactly-once-delivery. Publi
 
 SGQueue leverages PostgreSQL to store and manage messages using an SQL table for storing messages and a dead-letter table for storing failed messages. The client library handles enqueueing, dequeuing, and processing, with a scheduler managing delayed messages and stuck messages.
 
-[Architecture](./architecture.png)
+![Architecture](./architecture.png)
 
 ## Features
 
@@ -25,10 +25,18 @@ SGQueue leverages PostgreSQL to store and manage messages using an SQL table for
 
 ## Running Tests
 
-SGQueue includes tests to verify all features stated above:
+SGQueue uses `TestContainers` to spin up a test instance of a postgres database.
+To run the tests, ensure that docker client is running on your machine. You can optionally replace the test-container section with another database connection string if you want to opt-in for a non-docker based test.
+Run the tests using:
 
 ```bash
 make test
+```
+
+Run the benchmarks with:
+
+```bash
+make bench
 ```
 
 ## TODO
