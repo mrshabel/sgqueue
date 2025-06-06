@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,7 +13,7 @@ type Queue interface {
 	// Produce adds a new message to the underlying queue. A non-nil error is returned if the idempotency key is duplicated.
 	Produce(payload any, priority int, idempotencyKey string) error
 	// Consume dequeues a message from the queue in order of their priority and time the record was created
-	Consume() (*SGMessage, error)
+	Consume(ctx context.Context, bufferSize int) (<-chan *SGMessage, error)
 	// ConsumeBatch dequeues bulk messages with a batch size from the queue in order of their priority and time the record was created
 	ConsumeBatch(int) ([]*SGMessage, error)
 	// ConsumeFailed consumes all failed messages from the dead-letter queue
@@ -73,34 +74,59 @@ func (q *SGQueue) Produce(payload any, priority int, idempotencyKey string) erro
 	return q.db.AddMessage(ctx, msg)
 }
 
-// Consume dequeues a message from the queue in order of their priority and time the record was created. It is the caller's responsibility to call either the Ack method after a successful implementation or Nack after a failure occurs.
-func (q *SGQueue) Consume() (*SGMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), q.processingTimeout)
-	defer cancel()
-
-	// consume old message from db
-	msg, err := q.db.GetMessage(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// return if no message is present
-	if msg == nil {
-		return nil, nil
+// Consume dequeues a message from the queue in order of their priority and time the record was created
+// Consume returns a channel that continuously receives messages from the queue.
+// The caller must provide a context for cancellation and a buffer size for the channel.
+// The channel will be closed when the context is cancelled or an error occurs.
+// It is the caller's responsibility to call either the Ack method after a successful implementation or Nack after a failure occurs.
+func (q *SGQueue) Consume(ctx context.Context, bufferSize int) (<-chan *SGMessage, error) {
+	// default to 20 as buffer size
+	if bufferSize < 1 {
+		bufferSize = 20
 	}
 
-	// decode json payload
-	var payload any
-	payloadBytes, ok := msg.Payload.([]byte)
+	messages := make(chan *SGMessage, bufferSize)
 
-	if !ok {
-		return nil, fmt.Errorf("unexpected payload: %v,  expected []byte", msg.Payload)
-	}
+	// TODO: use listeners for signaling when a new message arrives
+	// poll messages from the queue
+	ticker := time.NewTicker(1 * time.Second)
 
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal message payload: %v", err)
-	}
+	go func() {
+		// cleanup resources
+		defer close(messages)
+		defer ticker.Stop()
 
-	return &SGMessage{Message: *msg, Payload: payload, queue: q}, nil
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m, err := q.db.GetMessage(ctx)
+				if err != nil {
+					// skip if no message is available
+					if err == sql.ErrNoRows {
+						continue
+					}
+					log.Printf("error consuming message in channel: %v\n", err)
+					return
+				}
+				// skip if no message was found
+				if m == nil {
+					continue
+				}
+
+				msg, err := q.composeMessage(m)
+				// invalid message
+				if err != nil {
+					log.Printf("error composing retrieved message from storage: %v\n", err)
+					return
+				}
+				// add message to channel
+				messages <- msg
+			}
+		}
+	}()
+	return messages, nil
 }
 
 // ConsumeBatch dequeues bulk messages with a batch size from the queue in order of their priority and time the record was created
@@ -195,6 +221,23 @@ func (m *SGMessage) Retry() error {
 
 // helper methods
 
+// composeMessage parses the message from the underlying storage into a broker-compatible message
+func (q *SGQueue) composeMessage(msg *Message) (*SGMessage, error) {
+	// decode json payload
+	var payload any
+	payloadBytes, ok := msg.Payload.([]byte)
+
+	if !ok {
+		return nil, fmt.Errorf("unexpected payload: %v,  expected []byte", msg.Payload)
+	}
+
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal message payload: %v", err)
+	}
+
+	return &SGMessage{Message: *msg, Payload: payload, queue: q}, nil
+}
+
 func (q *SGQueue) ack(id int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), q.processingTimeout)
 	defer cancel()
@@ -214,4 +257,17 @@ func (q *SGQueue) retry(id int) error {
 	defer cancel()
 
 	return q.db.UpdateRetries(ctx, id, MessagePending)
+}
+
+// DecodeJSONPayload unmarshal the retrieved message into the struct provided
+func (msg *SGMessage) DecodeJSONPayload(out any) error {
+	// marshal payload into bytes and unmarshal it into input json struct
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+	if err := json.Unmarshal(payloadBytes, out); err != nil {
+		return fmt.Errorf("failed to unmarshal into target JSON: %w", err)
+	}
+	return nil
 }

@@ -80,47 +80,89 @@ func testProduce(t *testing.T, sgq *SGQueue) {
 	idempotencyKey = "updated random queue"
 	err = sgq.Produce(payload, priority, idempotencyKey)
 	require.NoError(t, err)
+
+	// consume produced messages (2)
+	messages, err := sgq.Consume(context.Background(), 2)
+	require.NoError(t, err)
+	for range 2 {
+		msg := <-messages
+		require.NotNil(t, msg)
+		// acknowledge message
+		err := msg.Ack()
+		require.NoError(t, err)
+	}
 }
 
 func testConsume(t *testing.T, sgq *SGQueue) {
-	// consume 2 messages from previous stage
-	for range 2 {
-		msg, err := sgq.Consume()
-		require.NoError(t, err)
-		require.NotNil(t, msg)
+	t.Helper()
+	// create consumer channel
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-		// acknowledge messages
-		err = msg.Ack()
+	messages, err := sgq.Consume(ctx, 10)
+	require.NoError(t, err)
+
+	// produce test messages
+	samplePayloads := []string{"message 1", "message 2", "message 3"}
+	for i, payload := range samplePayloads {
+		err = sgq.Produce(payload, i, fmt.Sprintf("key-%v", i))
 		require.NoError(t, err)
 	}
 
-	// consume with no message present
-	msg, err := sgq.Consume()
-	require.NoError(t, err)
-	require.Nil(t, msg)
+	// consume and verify messages
+	consumed := 0
+	for range len(samplePayloads) {
+		select {
+		case msg := <-messages:
+			if msg == nil {
+				continue
+			}
+			payload, ok := msg.Payload.(string)
+			require.True(t, ok, "expected string output")
+			require.Contains(t, samplePayloads, payload)
 
-	// add new message and send a nack
-	payload := "this is to test consume"
-	err = sgq.Produce(payload, 0, "test consume random key")
-	require.NoError(t, err)
-	msg, err = sgq.Consume()
-	require.NoError(t, err)
-	err = msg.Nack()
+			// acknowledge message
+			err := msg.Ack()
+			require.NoError(t, err)
+			consumed++
+
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for messages, consumed: %d, expected: %d", consumed, len(samplePayloads))
+		}
+	}
+
+	// test retry message
+	err = sgq.Produce("this is to test retry", 0, "retry-key")
 	require.NoError(t, err)
 
 	// consume message
-	msg, err = sgq.Consume()
-	require.NoError(t, err)
-	require.Equal(t, msg.Payload, payload)
-
-	// retry
+	msg := <-messages
+	require.NotNil(t, msg)
 	err = msg.Retry()
 	require.NoError(t, err)
 
-	// finally consume message and check retry count
-	msg, err = sgq.Consume()
+	// verify that only one retry is present and ack message
+	retryMsg := <-messages
+	require.Equal(t, 1, retryMsg.Message.Retries)
+	err = retryMsg.Ack()
 	require.NoError(t, err)
-	require.Equal(t, msg.Message.Retries, 1)
+
+	// test nack
+	err = sgq.Produce("this is to test nack", 0, "nack-key")
+	require.NoError(t, err)
+
+	// consume message
+	msg = <-messages
+	require.NotNil(t, msg)
+	err = msg.Nack()
+	require.NoError(t, err)
+
+	// verify that same message was retrieved
+	nackMsg := <-messages
+	require.NotNil(t, nackMsg)
+	require.Equal(t, nackMsg.Message.ID, msg.Message.ID)
+	err = nackMsg.Ack()
+	require.NoError(t, err)
 }
 
 func testConsumeBatch(t *testing.T, sgq *SGQueue) {
@@ -250,19 +292,29 @@ func benchmarkConsume(b *testing.B, sgq *SGQueue) {
 
 	b.ResetTimer()
 
-	for range b.N {
-		msg, err := sgq.Consume()
-		if err != nil {
-			b.Fatalf("failed to consume message: %v", err)
-		}
+	// consume messages up to benchmark size
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	messages, err := sgq.Consume(ctx, b.N)
+	if err != nil {
+		b.Fatalf("failed to register consumer: %v", err)
+	}
+
+	consumed := 0
+	for msg := range messages {
 		if msg == nil {
 			b.Fatalf("no message to consume")
 		}
-
 		err = msg.Ack()
 		if err != nil {
 			b.Fatalf("failed to acknowledge message: %v", err)
 		}
+		consumed++
+		if consumed >= b.N {
+			break
+		}
+
 	}
 }
 
